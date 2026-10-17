@@ -86,32 +86,112 @@ flowchart TD
 
 ---
 
-## Wire Protocol Specification
+## Packet Container & Wire Protocol
 
-All multi-byte fields are transmitted in **Network Byte Order (Big-Endian)**.
+The core data abstraction is `darkfire::net::Packet`, a unified container that pairs a transport wire header with a dynamic, zero-copy byte buffer:
 
-### TCP Packet Format
 ```
-+----------------+---------------+---------------+-------------------+------------------+-------------------+--------------------+
-| Magic (2B)     | Version (1B)  | Flags (1B)    | Message ID (2B)   | Body Size (4B)   | Checksum (4B)     | Payload (N Bytes)  |
-| 0xDF4E         | 0x02          | Bitfield      | uint16_t          | uint32_t         | CRC32             | Raw serialized data|
-+----------------+---------------+---------------+-------------------+------------------+-------------------+--------------------+
+                    +----------------------------------------------+
+                    |            Packet Class Container            |
+                    |   (Unified C++20 Memory & Transport View)    |
+                    +----------------------++----------------------+
+                                           ||
+             +-----------------------------++----------------------------+
+             |                                                           |
+             v                                                           v
++-------------------------------+                       +-------------------------------+
+|     Transport Wire Header     |                       |       Dynamic Payload         |
++-------------------------------+                       +-------------------------------+
+| TCPHeader (14 B, #pragma pack)|                       | ByteWriter (FIFO Stream)      |
+|          -- OR --             |                       | std::vector<uint8_t> buffer   |
+| UDPHeader (30 B, #pragma pack)|                       | std::span / BufferView        |
+| (Magic, ID, Sequence, CRC32)  |                       | (Zero-copy binary slices)     |
++-------------------------------+                       +-------------------------------+
+             |                                                           |
+             +-----------------------------++----------------------------+
+                                           ||
+                        +------------------vv-----------------+
+                        |   Streaming Operators & Helpers     |
+                        |     packet << x << y << str;        |
+                        |     packet.FinalizeTCP() / UDP()    |
+                        |     packet.ValidateChecksum()       |
+                        +-------------------------------------+
 ```
-- Total header size: **14 bytes**.
-- Checksum: IEEE 802.3 CRC32 computed over the payload bytes.
-- Packets with invalid magic bytes or checksum mismatch are rejected before body processing.
 
-### UDP Packet Format
+All multi-byte integer and float fields in wire headers are transmitted in **Network Byte Order (Big-Endian)**.
+
+---
+
+### TCP Wire Framing (14-Byte Header)
+
 ```
-+------------+-----------+----------+---------------+----------------+------------+------------------+-----------------+------------------+----------------+---------------+--------------------+
-| Magic (2B) | Ver (1B)  | Flg (1B) | Msg ID (2B)   | Seq ID (4B)    | ACK ID (4B)| ACK Bitmask (4B) | Frag Idx (2B)   | Frag Count (2B)  | Body Size (4B) | Checksum (4B) | Payload (N Bytes)  |
-| 0xDF55     | 0x02      | Bitfield | uint16_t      | uint32_t       | uint32_t   | uint32_t         | uint16_t        | uint16_t         | uint32_t       | CRC32         | Datagram chunk     |
-+------------+-----------+----------+---------------+----------------+------------+------------------+-----------------+------------------+----------------+---------------+--------------------+
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Magic (0xDF4E)        |    Version    |     Flags     |  0x00 - 0x03
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Message ID           |      Body Size (High 16)      |  0x04 - 0x07
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      Body Size (Low 16)       |       Checksum (High 16)      |  0x08 - 0x0B
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Checksum (Low 16)       |       Payload Data ...        |  0x0C - 0x0F
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+:                                                               :
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
-- Total header size: **30 bytes**.
-- `Seq ID`: Monotonically increasing sequence number per peer (handles 32-bit wrap-around).
-- `ACK ID` & `ACK Bitmask`: Acknowledges the latest received sequence and the preceding 32 packets.
-- `Frag Idx` & `Frag Count`: Automatic slicing for payloads exceeding `STANDARD_MTU` (1200 bytes).
+
+| Offset | Field | Type | Size | Description |
+| :---: | :--- | :---: | :---: | :--- |
+| `0x00` | `magic` | `uint16_t` | 2 B | Magic framing identifier (`0xDF4E`) |
+| `0x02` | `version` | `uint8_t` | 1 B | Protocol version (`0x02`) |
+| `0x03` | `flags` | `uint8_t` | 1 B | Control flags (`Handshake`, `Ping/Pong`, `System`) |
+| `0x04` | `message_id` | `uint16_t` | 2 B | Application message identifier / enum |
+| `0x06` | `body_size` | `uint32_t` | 4 B | Payload size in bytes (enforces $\le$ 64 KB limit) |
+| `0x0A` | `checksum` | `uint32_t` | 4 B | IEEE 802.3 CRC32 computed over payload bytes |
+| `0x0E` | `payload` | `uint8_t[]` | $N$ B | Forward FIFO serialized body |
+
+---
+
+### UDP Wire Framing (30-Byte Header)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Magic (0xDF55)        |    Version    |     Flags     |  0x00 - 0x03
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Message ID           |     Sequence ID (High 16)     |  0x04 - 0x07
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Sequence ID (Low 16)      |        Ack ID (High 16)       |  0x08 - 0x0B
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        Ack ID (Low 16)        |     Ack Bitfield (High 16)    |  0x0C - 0x0F
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Ack Bitfield (Low 16)     |        Fragment Index         |  0x10 - 0x13
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        Fragment Count         |      Body Size (High 16)      |  0x14 - 0x17
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      Body Size (Low 16)       |       Checksum (High 16)      |  0x18 - 0x1B
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Checksum (Low 16)       |       Datagram Chunk ...      |  0x1C - 0x1F
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+:                                                               :
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Offset | Field | Type | Size | Description |
+| :---: | :--- | :---: | :---: | :--- |
+| `0x00` | `magic` | `uint16_t` | 2 B | Magic datagram identifier (`0xDF55`) |
+| `0x02` | `version` | `uint8_t` | 1 B | Protocol version (`0x02`) |
+| `0x03` | `flags` | `uint8_t` | 1 B | Bitflags (`Reliable`, `Fragmented`, `Ping/Pong`) |
+| `0x04` | `message_id` | `uint16_t` | 2 B | Application message identifier / enum |
+| `0x06` | `sequence_id` | `uint32_t` | 4 B | Monotonically increasing datagram sequence ID |
+| `0x0A` | `ack_id` | `uint32_t` | 4 B | Latest remote sequence ID acknowledged |
+| `0x0E` | `ack_bitfield` | `uint32_t` | 4 B | 32-bit sliding window history of previous ACKs |
+| `0x12` | `fragment_index` | `uint16_t` | 2 B | Zero-based slice index for MTU fragmentation |
+| `0x14` | `fragment_count` | `uint16_t` | 2 B | Total fragment slices in payload (1 if unfragmented) |
+| `0x16` | `body_size` | `uint32_t` | 4 B | Chunk payload size in bytes ($\le$ 1200 MTU) |
+| `0x1A` | `checksum` | `uint32_t` | 4 B | IEEE 802.3 CRC32 of chunk payload |
+| `0x1E` | `payload` | `uint8_t[]` | $N$ B | Raw datagram chunk |
 
 ---
 
